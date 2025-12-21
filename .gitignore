@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+
+# Env vars / secrets
+.env
+
+# Data files (keep raw logs out of git)
+data/raw/
+data/processed/
+outputs/
+
+# OS
+.DS_Store
+
+# Streamlit
+.streamlit/
