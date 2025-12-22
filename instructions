@@ -1,0 +1,116 @@
+# ============================================================
+# Poker Analysis — Quick Run Guide (bash commands + what they do)
+# ============================================================
+
+# 0) Go to the project root (the folder that contains src/, data/, etc.)
+cd "/Users/andrewchristofferson/Poker Game Analysis/poker-analysis"
+
+# 1) Activate your venv (skip if you already see (.venv) in your terminal prompt)
+source .venv/bin/activate
+
+# 2) Install dependencies (safe to re-run)
+pip install -r requirements.txt
+# If you don’t have requirements.txt, this usually works:
+pip install streamlit pandas numpy matplotlib pyarrow
+
+
+# ============================================================
+# A) RUN BASIC ANALYSIS (generates outputs/ files used by Streamlit)
+# ============================================================
+
+python -m src.run_analysis data/raw/stanford_poker_log.csv \
+  --outdir outputs \
+  --entry_col entry \
+  --autodetect_blinds
+
+# What it does:
+# - Parses the poker log CSV
+# - Writes outputs/events.parquet (all parsed events)
+# - Writes outputs/player_summary.csv (vpip, hands played, aggression frequencies)
+# - Writes outputs/hand_player_details.csv (per hand/player flags, combo info, summaries)
+# - Writes outputs/ranges.csv (default “known hole” range counts)
+# - Writes outputs/ranges_showdown.csv (showdown-only range counts)
+# - Writes outputs/ranges_by_position.csv
+
+
+# ============================================================
+# B) RUN WITH DEBUGGING OUTPUTS (to find where data loss happens)
+# ============================================================
+
+python -m src.run_analysis data/raw/stanford_poker_log.csv \
+  --outdir outputs \
+  --entry_col entry \
+  --autodetect_blinds \
+  --debug
+
+# What it does (in addition to basic analysis):
+# - Writes outputs/debug_counts.json
+# - Writes outputs/debug_events_sample.csv (first ~500 events)
+# - Writes outputs/debug_hp2_sample.csv (first ~500 hp2 rows)
+# - Writes outputs/debug_known_cards_events.csv (all hole/shows events)
+
+
+# ============================================================
+# C) PRINT PER-HAND PARSE SUMMARIES (verbose: helps validate each hand)
+# ============================================================
+
+python -m src.run_analysis data/raw/stanford_poker_log.csv \
+  --outdir outputs \
+  --entry_col entry \
+  --autodetect_blinds \
+  --verbose_hands
+
+# What it does:
+# - Prints a summary for each hand:
+#   dealer, seats inferred, positions inferred, board, pot tracked, event counts
+# - Useful when you suspect the parser is skipping hands or missing stacks/board/actions
+
+
+# ============================================================
+# D) QUICKLY VIEW KEY DEBUG FILES
+# ============================================================
+
+# High-level counts (hands/events/combos/etc.)
+cat outputs/debug_counts.json
+
+# See if actions and cards are being parsed (CSV view)
+head -n 50 outputs/debug_events_sample.csv
+head -n 50 outputs/debug_hp2_sample.csv
+head -n 50 outputs/debug_known_cards_events.csv
+
+
+# ============================================================
+# E) LAUNCH STREAMLIT APP (dashboard)
+# ============================================================
+
+# IMPORTANT: run Streamlit from the folder that contains src/
+# and point to the correct file.
+streamlit run src/app.py
+
+# If you want to run a different outputs folder:
+# - Use the sidebar “Output directory” field inside the app (set to outputs by default)
+
+# What it does:
+# - Opens a local dashboard in your browser
+# - Loads outputs/*.csv and outputs/events.parquet
+# - Shows player summary, aggression, sizing, recent actions, range grid, and drill-down
+
+
+# ============================================================
+# F) COMMON “NOT WORKING” FIXES
+# ============================================================
+
+# 1) "File does not exist: app.py"
+# You’re likely running from the wrong directory.
+# From project root: use
+streamlit run src/app.py
+
+# 2) Streamlit shows empty tables
+# That almost always means outputs/ is empty or stale.
+# Re-run analysis:
+python -m src.run_analysis data/raw/stanford_poker_log.csv --outdir outputs --entry_col entry --autodetect_blinds
+
+# 3) Ensure outputs exist
+ls -lah outputs
+# You should see:
+# events.parquet, player_summary.csv, hand_player_details.csv, ranges.csv, ranges_by_position.csv

@@ -1,940 +1,787 @@
-from __future__ import annotations
-
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
-from collections import defaultdict, Counter
 
 import numpy as np
 import pandas as pd
 
 
-# ----------------------------
-# Card parsing + wetness
-# ----------------------------
+# -------------------------
+# Card helpers
+# -------------------------
+_RANK_ORDER = ["A", "K", "Q", "J", "10", "9", "8", "7", "6", "5", "4", "3", "2"]
+_RANK_INDEX = {r: i for i, r in enumerate(_RANK_ORDER)}
 
-RANK_TO_VAL = {
-    "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "10": 10,
-    "J": 11, "Q": 12, "K": 13, "A": 14
-}
-HIGH_RANKS = {"A", "K", "Q", "J", "10"}
+_CARD_RE = re.compile(r"(?P<rank>10|[2-9AJQK])(?P<suit>[♠♥♦♣])")
 
-SUIT_CHARS = {"♠", "♥", "♦", "♣"}
-
-_card_token_re = re.compile(r"\s*(10|[2-9JQKA])([♠♥♦♣])\s*")
-
-
-def parse_card(token: str) -> Tuple[str, str, int]:
+def parse_card(card_str: str) -> Optional[Tuple[str, str]]:
     """
-    Returns (rank_str, suit_char, rank_value).
-    token examples: 'K♠', '10♣', 'A♦'
+    Returns (rank, suit) where rank is one of: A,K,Q,J,10,9..2 and suit is ♠♥♦♣.
     """
-    m = _card_token_re.fullmatch(token.strip())
+    if not isinstance(card_str, str):
+        return None
+    card_str = card_str.strip()
+    m = _CARD_RE.search(card_str)
     if not m:
-        raise ValueError(f"Could not parse card token: {token!r}")
-    r, s = m.group(1), m.group(2)
-    return r, s, RANK_TO_VAL[r]
+        return None
+    rank = m.group("rank")
+    suit = m.group("suit")
+    return rank, suit
 
+def normalize_rank(rank: str) -> str:
+    if rank == "T":
+        return "10"
+    return rank
 
-def parse_card_list(cards_str: str) -> List[str]:
+def cards_from_bracket_list(s: str) -> List[str]:
     """
-    Parses "5♥, A♥, 2♥" or "[5♥, A♥, 2♥]" into ['5♥','A♥','2♥'] (preserving '10♠' tokens).
+    Extracts card strings like ['A♠','10♦'] from fragments like:
+      "Flop:  [3♣, 2♥, 9♦]"
+      "Turn: 3♣, 2♥, 9♦ [8♣]"
+      "River: 3♣, 2♥, 9♦, 8♣ [A♠]"
     """
-    s = cards_str.strip()
-    s = s.strip("[]")
-    parts = [p.strip() for p in s.split(",") if p.strip()]
-    # normalize spacing
-    return parts
+    if not isinstance(s, str):
+        return []
+    cards = _CARD_RE.findall(s)
+    out = []
+    for r, suit in cards:
+        r = normalize_rank(r)
+        out.append(f"{r}{suit}")
+    return out
 
 
-def wetness_score(board_cards: List[str]) -> float:
-    """
-    Heuristic wetness score 0-100 based on:
-      - high cards
-      - suits (flush potential)
-      - connectivity (straight potential)
-      - pairedness (more static)
-      - dynamic-ness (draw heavy boards are dynamic)
-    Uses only current street board_cards.
-    """
-    if len(board_cards) < 3:
-        return 0.0
-
-    ranks = []
-    suits = []
-    for c in board_cards:
-        r, s, v = parse_card(c)
-        ranks.append((r, v))
-        suits.append(s)
-
-    rank_strs = [rv[0] for rv in ranks]
-    rank_vals = sorted([rv[1] for rv in ranks])
-
-    # High card component
-    high_cnt = sum(1 for r in rank_strs if r in HIGH_RANKS)
-    high_comp = min(30.0, 8.0 * high_cnt + (5.0 if max(rank_vals) >= 13 else 0.0))  # K/A boosts
-
-    # Suit / flush component
-    suit_counts = Counter(suits)
-    max_suit = max(suit_counts.values())
-    if len(board_cards) == 3:
-        # flop
-        if max_suit == 3:
-            suit_comp = 40.0
-        elif max_suit == 2:
-            suit_comp = 25.0
-        else:
-            suit_comp = 5.0
-    else:
-        # turn/river: draw strength based on max suit count
-        if max_suit >= 4:
-            suit_comp = 40.0
-        elif max_suit == 3:
-            suit_comp = 25.0
-        else:
-            suit_comp = 5.0
-
-    # Connectivity component (straighty-ness)
-    # Use span + gaps heuristic
-    unique_vals = sorted(set(rank_vals))
-    span = unique_vals[-1] - unique_vals[0]
-    # Count adjacent gaps
-    gaps = sum(1 for i in range(1, len(unique_vals)) if unique_vals[i] - unique_vals[i-1] >= 2)
-
-    if span <= 4:
-        conn_comp = 35.0
-    elif span <= 6:
-        conn_comp = 22.0
-    elif span <= 8:
-        conn_comp = 12.0
-    else:
-        conn_comp = 5.0
-
-    # Penalize disconnected boards
-    conn_comp -= 4.0 * gaps
-    conn_comp = max(0.0, conn_comp)
-
-    # Pairedness (more static -> reduce)
-    counts = Counter(rank_vals)
-    paired = any(v >= 2 for v in counts.values())
-    trips = any(v >= 3 for v in counts.values())
-    pair_pen = 10.0 if paired else 0.0
-    pair_pen += 8.0 if trips else 0.0
-
-    # Dynamic bonus: draws present
-    flush_draw_present = (max_suit >= 2 and len(board_cards) == 3) or (max_suit >= 3 and len(board_cards) == 4)
-    straight_draw_present = (span <= 6)  # coarse
-    dyn_bonus = 10.0 if (flush_draw_present or straight_draw_present) else 0.0
-
-    score = high_comp + suit_comp + conn_comp + dyn_bonus - pair_pen
-    return float(np.clip(score, 0.0, 100.0))
-
-
-def bucket_pot_fraction(x: Optional[float]) -> str:
-    if x is None or np.isnan(x):
+def pot_bucket(pot_frac: float) -> str:
+    if pot_frac is None or pd.isna(pot_frac):
         return "unknown"
-    if x < 0.25:
-        return "<1/4"
-    if x < 0.45:
-        return "~1/3"
-    if x < 0.60:
-        return "~1/2"
-    if x < 0.85:
-        return "~3/4"
-    if x < 1.25:
-        return "~pot"
-    return "overbet"
+    if pot_frac <= 0.25:
+        return "0-25%"
+    if pot_frac <= 0.50:
+        return "25-50%"
+    if pot_frac <= 0.75:
+        return "50-75%"
+    if pot_frac <= 1.00:
+        return "75-100%"
+    if pot_frac <= 1.50:
+        return "100-150%"
+    return "150%+"
 
 
-# ----------------------------
-# Event structures
-# ----------------------------
+def compute_wetness(board_cards: List[str]) -> float:
+    """
+    Placeholder wetness measure (0..100). Robust + deterministic but not poker-perfect.
+    Returns NaN if board unknown.
+    """
+    if not board_cards:
+        return np.nan
+    # basic: more connected/flushy boards are "wetter"
+    parsed = [parse_card(c) for c in board_cards if parse_card(c)]
+    if len(parsed) < 3:
+        return np.nan
 
-STREETS = ["PREFLOP", "FLOP", "TURN", "RIVER"]
+    ranks = [p[0] for p in parsed]
+    suits = [p[1] for p in parsed]
+
+    # flushiness
+    max_suit = max(pd.Series(suits).value_counts().max(), 1)
+    flush_score = {1: 0, 2: 25, 3: 55, 4: 80, 5: 95}.get(int(max_suit), 95)
+
+    # connectivity (rough)
+    # map ranks to numeric
+    def r_to_n(r: str) -> int:
+        order = {"A": 14, "K": 13, "Q": 12, "J": 11, "10": 10,
+                 "9": 9, "8": 8, "7": 7, "6": 6, "5": 5, "4": 4, "3": 3, "2": 2}
+        return order.get(r, 0)
+
+    nums = sorted([r_to_n(r) for r in ranks], reverse=True)
+    gaps = []
+    for a, b in zip(nums, nums[1:]):
+        gaps.append(abs(a - b))
+    gap_score = 0
+    if gaps:
+        # small gaps => wetter
+        avg_gap = float(np.mean(gaps))
+        if avg_gap <= 1.5:
+            gap_score = 60
+        elif avg_gap <= 2.5:
+            gap_score = 40
+        elif avg_gap <= 4.0:
+            gap_score = 20
+        else:
+            gap_score = 5
+
+    # paired boards are slightly drier (fewer straight/flush combos)
+    pair_penalty = 0
+    if len(set(ranks)) < len(ranks):
+        pair_penalty = 10
+
+    wet = 0.6 * flush_score + 0.4 * gap_score - pair_penalty
+    return float(np.clip(wet, 0, 100))
 
 
-@dataclass
-class ActionEvent:
-    hand_no: int
-    street: str
-    idx: int  # global row index in chronological stream
-    raw: str
+def infer_positions(seat_order: List[str], dealer: Optional[str]) -> Dict[str, str]:
+    """
+    Given seat_order around the table and dealer name, infer basic position labels.
+    If dealer missing or not in seat_order, returns {}.
+    """
+    if not dealer or not seat_order or dealer not in seat_order:
+        return {}
 
-    player: Optional[str] = None
-    kind: str = ""  # e.g. 'call','bet','raise','fold','check','post_sb','post_bb','uncalled','collected','shows','mucks','board'
-    amount: Optional[int] = None  # amount in chips for the action (interpretation depends on kind)
-    pot_before: Optional[int] = None
-    pot_after: Optional[int] = None
-    delta_put_in: Optional[int] = None  # for bet/call/raise: how many chips added now
-    pot_frac: Optional[float] = None  # delta_put_in / pot_before for bet/raise/bet-like events
-    pot_frac_bucket: Optional[str] = None
+    n = len(seat_order)
+    di = seat_order.index(dealer)
 
-    board: List[str] = field(default_factory=list)
-    wetness: Optional[float] = None
+    # order starting at dealer (button), then clockwise
+    rot = seat_order[di:] + seat_order[:di]
 
-    # For showdown parsing
-    show_cards: Optional[Tuple[str, str]] = None
+    pos_map = {}
+
+    if n == 2:
+        pos_map[rot[0]] = "BU/SB"
+        pos_map[rot[1]] = "BB"
+        return pos_map
+
+    # always define BU/SB/BB first
+    pos_map[rot[0]] = "BU"
+    pos_map[rot[1]] = "SB"
+    pos_map[rot[2]] = "BB"
+
+    # remaining seats
+    rest = rot[3:]
+    # common naming sets by table size
+    # these labels are "good enough" for filtering; can refine later
+    name_sets = {
+        3: [],
+        4: ["UTG"],
+        5: ["UTG", "CO"],
+        6: ["UTG", "MP", "CO"],
+        7: ["UTG", "UTG+1", "MP", "CO"],
+        8: ["UTG", "UTG+1", "UTG+2", "MP", "HJ", "CO"],
+        9: ["UTG", "UTG+1", "UTG+2", "MP", "MP+1", "HJ", "CO"],
+    }
+    labels = name_sets.get(n, [])
+    if not labels and len(rest) > 0:
+        labels = [f"POS{i+1}" for i in range(len(rest))]
+
+    for p, lab in zip(rest, labels):
+        pos_map[p] = lab
+
+    return pos_map
+
+
+# -------------------------
+# Regex patterns
+# -------------------------
+RE_START = re.compile(r"--\s*starting hand\s*#(?P<hn>\d+).*?\(dealer:\s*\"(?P<dealer>[^\"]+)\"\)")
+RE_END = re.compile(r"--\s*ending hand\s*#(?P<hn>\d+)\s*--")
+
+RE_STACKS = re.compile(r"Player stacks:\s*(?P<body>.+)$")
+RE_STACK_ITEM = re.compile(r"#(?P<seat>\d+)\s*\"(?P<name>[^\"]+)\"\s*\((?P<stack>[0-9]+(?:\.[0-9]+)?)\)")
+
+RE_YOUR_HAND = re.compile(r"Your hand is\s*(?P<c1>[^,]+),\s*(?P<c2>.+)$")
+
+RE_POST_BLIND = re.compile(r"\"(?P<player>[^\"]+)\"\s+posts a\s+(?P<which>small|big)\s+blind of\s+(?P<amt>[0-9]+(?:\.[0-9]+)?)")
+RE_CHECK = re.compile(r"\"(?P<player>[^\"]+)\"\s+checks")
+RE_FOLD = re.compile(r"\"(?P<player>[^\"]+)\"\s+folds")
+RE_CALL = re.compile(r"\"(?P<player>[^\"]+)\"\s+calls\s+(?P<amt>[0-9]+(?:\.[0-9]+)?)")
+RE_BET = re.compile(r"\"(?P<player>[^\"]+)\"\s+bets\s+(?P<amt>[0-9]+(?:\.[0-9]+)?)")
+RE_RAISE_TO = re.compile(r"\"(?P<player>[^\"]+)\"\s+raises to\s+(?P<amt>[0-9]+(?:\.[0-9]+)?)")
+
+RE_UNCALLED = re.compile(r"Uncalled bet of\s+(?P<amt>[0-9]+(?:\.[0-9]+)?)\s+returned to\s+\"(?P<player>[^\"]+)\"")
+RE_COLLECTED = re.compile(r"\"(?P<player>[^\"]+)\"\s+collected\s+(?P<amt>[0-9]+(?:\.[0-9]+)?)\s+from pot")
+RE_SHOWS = re.compile(r"\"(?P<player>[^\"]+)\"\s+shows a\s+(?P<c1>[^,]+),\s*(?P<c2>.+?)[\.\,]$")
+
+RE_BOARD_FLOP = re.compile(r"^Flop:\s*(?P<body>.+)$")
+RE_BOARD_TURN = re.compile(r"^Turn:\s*(?P<body>.+)$")
+RE_BOARD_RIVER = re.compile(r"^River:\s*(?P<body>.+)$")
+
+RE_ALLIN_HINT = re.compile(r"\bgo all in\b", re.IGNORECASE)
 
 
 @dataclass
 class HandState:
     hand_no: int
-    hand_id: Optional[str] = None
-    dealer: Optional[str] = None  # may appear in log; not required
-    players: List[str] = field(default_factory=list)
-    seat_map: Dict[str, int] = field(default_factory=dict)
-
-    sb_player: Optional[str] = None
-    bb_player: Optional[str] = None
-    sb_amt: int = 20
-    bb_amt: int = 40
-
+    dealer: Optional[str] = None
+    seat_order: List[str] = field(default_factory=list)
+    pos_map: Dict[str, str] = field(default_factory=dict)
+    current_street: str = "PREFLOP"
     board: List[str] = field(default_factory=list)
-    street: str = "PREFLOP"
-    pot: int = 0
-    contrib_street: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
-    active: Dict[str, bool] = field(default_factory=dict)
+    pot: float = 0.0
+    put_in_street: Dict[str, float] = field(default_factory=dict)
 
-    # For VPIP / "voluntarily made it past preflop"
-    preflop_total_put_in: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
-    vpip_flag: Dict[str, bool] = field(default_factory=lambda: defaultdict(bool))
-    voluntary_preflop_flag: Dict[str, bool] = field(default_factory=lambda: defaultdict(bool))
+    # hero inference
+    hero_cards: Optional[Tuple[str, str]] = None
+    hero_event_idx: Optional[int] = None  # index into global events list (for updating player)
+    lines_seen: int = 0
 
-    # Positions inferred
-    position: Dict[str, str] = field(default_factory=dict)
-
-    # Showdown/winners
-    river_dealt: bool = False
-    any_show: bool = False
-    collected: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
-    shown_cards: Dict[str, Tuple[str, str]] = field(default_factory=dict)
-
-    # For opportunities/aggression counts
-    opp: Dict[Tuple[str, str], int] = field(default_factory=lambda: defaultdict(int))   # (player, street) -> opp count
-    aggr: Dict[Tuple[str, str], int] = field(default_factory=lambda: defaultdict(int))  # (player, street) -> bet/raise count
-
-    # Sizing details
-    sizing_rows: List[Dict[str, Any]] = field(default_factory=list)
-
-
-# ----------------------------
-# Regex patterns
-# ----------------------------
-
-RE_ENDING = re.compile(r"^-- ending hand #(?P<handno>\d+)\s*--$")
-RE_STARTING = re.compile(
-    r"^-- starting hand #(?P<handno>\d+)\s*\(id:\s*(?P<handid>[^)]+)\)\s*\(No Limit Texas Hold'em\)\s*"
-    r"(?:\(dealer:\s*\"(?P<dealer>[^\"]+)\"\))?\s*--$"
-)
-
-RE_STACKS = re.compile(r"^Player stacks:\s*(?P<rest>.+)$")
-RE_STACK_ITEM = re.compile(r"#(?P<seat>\d+)\s+\"(?P<player>[^\"]+)\"\s+\((?P<stack>\d+)\)")
-
-RE_POST_BLIND = re.compile(r"^\"(?P<player>[^\"]+)\"\s+posts a\s+(?P<blind>small|big)\s+blind of\s+(?P<amt>\d+)$")
-
-RE_FOLD_CHECK = re.compile(r"^\"(?P<player>[^\"]+)\"\s+(?P<verb>folds|checks)$")
-RE_CALL = re.compile(r"^\"(?P<player>[^\"]+)\"\s+calls\s+(?P<amt>\d+)$")
-RE_BET = re.compile(r"^\"(?P<player>[^\"]+)\"\s+bets\s+(?P<amt>\d+)$")
-RE_RAISE = re.compile(r"^\"(?P<player>[^\"]+)\"\s+raises to\s+(?P<amt>\d+)(?:\s+and go all in)?$")
-
-RE_ALLIN = re.compile(r"^\"(?P<player>[^\"]+)\"\s+go all in(?:\s+for\s+(?P<amt>\d+))?$")
-
-RE_UNCALLED = re.compile(r"^Uncalled bet of\s+(?P<amt>\d+)\s+returned to\s+\"(?P<player>[^\"]+)\"$")
-RE_COLLECTED = re.compile(r"^\"(?P<player>[^\"]+)\"\s+collected\s+(?P<amt>\d+)\s+from pot(?:\s+with\s+(?P<desc>.+))?$")
-
-RE_SHOWS = re.compile(r"^\"(?P<player>[^\"]+)\"\s+shows a\s+(?P<c1>[^,]+),\s*(?P<c2>[^.]+)\.$")
-RE_MUCKS = re.compile(r"^\"(?P<player>[^\"]+)\"\s+mucks$")
-
-RE_FLOP = re.compile(r"^Flop:\s*\[(?P<cards>.+)\]\s*$")
-RE_TURN = re.compile(r"^Turn:\s*(?P<pre>.+?)\s*\[(?P<card>.+)\]\s*$")
-RE_RIVER = re.compile(r"^River:\s*(?P<pre>.+?)\s*\[(?P<card>.+)\]\s*$")
-
-
-# ----------------------------
-# Position inference
-# ----------------------------
-
-def position_labels(n_players: int) -> List[str]:
-    """
-    Returns labels in order of action preflop starting from UTG (first to act preflop),
-    ending with SB, BB at the end (standard full ring convention).
-    For short-handed, labels can overlap; we use composites.
-    """
-    if n_players <= 1:
-        return ["UNK"]
-    if n_players == 2:
-        # Heads-up: dealer is SB; preflop first to act is SB (button)
-        return ["BTN/SB", "BB"]
-    if n_players == 3:
-        # 3-handed: first to act preflop is BTN (also UTG)
-        return ["BTN/UTG", "SB", "BB"]
-
-    # 4+ players: UTG ... BTN, SB, BB
-    # Build a "middle" sequence that fits n-3 positions between UTG and BTN inclusive.
-    middle_count = n_players - 3  # positions excluding SB, BB, plus BTN included in middle
-    # Common names from early to late position:
-    base = ["UTG", "UTG+1", "UTG+2", "LJ", "HJ", "CO", "BTN"]
-    # Ensure enough labels:
-    if middle_count <= len(base):
-        mids = base[:middle_count - 1] + ["BTN"] if middle_count >= 1 else ["BTN"]
-    else:
-        # Extend with UTG+K until we can end with BTN
-        mids = []
-        for k in range(middle_count - 1):
-            mids.append(f"UTG+{k}" if k > 0 else "UTG")
-        mids.append("BTN")
-
-    return mids + ["SB", "BB"]
-
-
-def infer_positions(
-    players: List[str],
-    sb_player: str,
-    bb_player: str,
-    preflop_actor_order: List[str],
-) -> Dict[str, str]:
-    """
-    Infer positions based on blind posters and the rotation of preflop first actions.
-
-    preflop_actor_order: list of players in the order they first appear in PREFLOP actions
-      (fold/call/raise/bet/check) after blinds are posted.
-
-    We assign:
-      - SB and BB explicitly
-      - the first actor in preflop_actor_order that's not SB/BB becomes first label (UTG or BTN/UTG, etc.)
-      - continue for remaining players (excluding SB/BB) and force the last of the non-blinds to be BTN.
-
-    This method matches your "button = last to act before action returns to SB" rule.
-    """
-    pos = {p: "UNK" for p in players}
-    pos[sb_player] = "SB"
-    pos[bb_player] = "BB"
-
-    n = len(players)
-    labels = position_labels(n)
-
-    # Build circular order of non-blinds based on observed preflop first-actions.
-    # Keep only seated players.
-    seen = []
-    for p in preflop_actor_order:
-        if p in pos and p not in seen:
-            seen.append(p)
-
-    # Remove blinds from that sequence for assignment
-    nonblind_seen = [p for p in seen if p not in (sb_player, bb_player)]
-    nonblind_players = [p for p in players if p not in (sb_player, bb_player)]
-
-    # If we didn't observe everyone (rare), append missing non-blinds at end as unknown order.
-    for p in nonblind_players:
-        if p not in nonblind_seen:
-            nonblind_seen.append(p)
-
-    # Labels structure:
-    # labels = [<n-2 positions including BTN> , SB, BB]
-    nonblind_labels = labels[:-2]  # includes BTN somewhere at end for n>=3
-    # If lengths mismatch, trim/pad.
-    k = min(len(nonblind_labels), len(nonblind_seen))
-    for i in range(k):
-        pos[nonblind_seen[i]] = nonblind_labels[i]
-
-    # Override composites for short-handed correctness
-    if n == 2:
-        pos[sb_player] = "BTN/SB"
-        pos[bb_player] = "BB"
-    if n == 3:
-        # If sb/bb assigned, first nonblind is BTN/UTG; but in 3-handed, dealer may be BTN and SB posted by next seat.
-        # Keep "BTN/UTG" label for the first nonblind actor.
-        pass
-
-    return pos
-
-
-# ----------------------------
-# Main parser
-# ----------------------------
 
 class PokerLogParser:
-    def __init__(self, bb_amt: int = 40, sb_amt: int = 20):
-        self.bb_amt = bb_amt
-        self.sb_amt = sb_amt
-
-    def _apply_contribution(self, hand: HandState, player: str, new_total_this_street: int) -> Tuple[int, int]:
-        """
-        Update pot based on "calls X / bets X / raises to X" semantics:
-          - X is total put in by that player THIS street
-          - delta = X - current_contrib_this_street
-        Returns (delta, pot_before)
-        """
-        pot_before = hand.pot
-        prev = hand.contrib_street[player]
-        delta = new_total_this_street - prev
-        if delta < 0:
-            # Data glitch or multi-action lines; treat as 0 and keep consistent
-            delta = 0
-        hand.contrib_street[player] = new_total_this_street
-        hand.pot += delta
-        return delta, pot_before
-
-    def _new_street(self, hand: HandState, street: str, board_cards: List[str]):
-        hand.street = street
-        hand.contrib_street = defaultdict(int)  # reset per street contributions
-        hand.board = board_cards
-
-    def parse_csv(self, csv_path: str, entry_col: str = "entry") -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Returns:
-          - events_df: one row per parsed event (actions, boards, collected, etc.)
-          - summary_df: per-player summary
-        """
-        df = pd.read_csv(csv_path)
-
-        # Prefer 'order' if present; otherwise reverse the dataframe.
-        if "order" in df.columns:
-            df = df.sort_values("order", ascending=True).reset_index(drop=True)
-        else:
-            df = df.iloc[::-1].reset_index(drop=True)
-
-        lines = df[entry_col].astype(str).tolist()
-
-        hands: List[HandState] = []
-        events: List[ActionEvent] = []
-
-        current: Optional[HandState] = None
-        global_idx = 0
-
-        # We reconstruct hands by scanning chronological lines:
-        # starting hand -> actions -> ending hand.
-        for raw in lines:
-            raw = raw.strip()
-
-            m_end = RE_ENDING.match(raw)
-            if m_end:
-                # End previous hand (the one that just completed)
-                # Note: In your log, "-- ending hand #X --" appears at the TOP of the finished hand block.
-                # Chronologically, it will appear after the hand actions. We'll close on seeing it.
-                if current is not None:
-                    hands.append(current)
-                    current = None
-                global_idx += 1
-                continue
-
-            m_start = RE_STARTING.match(raw)
-            if m_start:
-                handno = int(m_start.group("handno"))
-                handid = (m_start.group("handid") or "").strip()
-                dealer = m_start.group("dealer")
-                current = HandState(
-                    hand_no=handno,
-                    hand_id=handid,
-                    dealer=dealer,
-                    sb_amt=self.sb_amt,
-                    bb_amt=self.bb_amt,
-                )
-                global_idx += 1
-                continue
-
-            if current is None:
-                # Ignore lines outside a hand
-                global_idx += 1
-                continue
-
-            # Player stacks
-            m_st = RE_STACKS.match(raw)
-            if m_st:
-                rest = m_st.group("rest")
-                players = []
-                seat_map = {}
-                for it in RE_STACK_ITEM.finditer(rest):
-                    seat = int(it.group("seat"))
-                    player = it.group("player")
-                    players.append(player)
-                    seat_map[player] = seat
-                current.players = players
-                current.seat_map = seat_map
-                current.active = {p: True for p in players}
-                global_idx += 1
-                continue
-
-            # Blinds
-            m_bl = RE_POST_BLIND.match(raw)
-            if m_bl:
-                p = m_bl.group("player")
-                blind = m_bl.group("blind")
-                amt = int(m_bl.group("amt"))
-                if blind == "small":
-                    current.sb_player = p
-                    current.sb_amt = amt
-                    current.pot += amt
-                    current.preflop_total_put_in[p] += amt
-                else:
-                    current.bb_player = p
-                    current.bb_amt = amt
-                    current.pot += amt
-                    current.preflop_total_put_in[p] += amt
-
-                ev = ActionEvent(
-                    hand_no=current.hand_no,
-                    street="PREFLOP",
-                    idx=global_idx,
-                    raw=raw,
-                    player=p,
-                    kind="post_sb" if blind == "small" else "post_bb",
-                    amount=amt,
-                    pot_before=current.pot - amt,
-                    pot_after=current.pot,
-                )
-                events.append(ev)
-                global_idx += 1
-                continue
-
-            # Board streets
-            m_fl = RE_FLOP.match(raw)
-            if m_fl:
-                cards = parse_card_list(m_fl.group("cards"))
-                self._new_street(current, "FLOP", cards)
-                w = wetness_score(cards)
-                ev = ActionEvent(current.hand_no, "FLOP", global_idx, raw, kind="board", board=cards, wetness=w)
-                events.append(ev)
-                global_idx += 1
-                continue
-
-            m_tu = RE_TURN.match(raw)
-            if m_tu:
-                # board shown as "a, b, c [turn]"
-                pre = parse_card_list(m_tu.group("pre"))
-                card = m_tu.group("card").strip()
-                cards = pre + [card]
-                self._new_street(current, "TURN", cards)
-                w = wetness_score(cards)
-                ev = ActionEvent(current.hand_no, "TURN", global_idx, raw, kind="board", board=cards, wetness=w)
-                events.append(ev)
-                global_idx += 1
-                continue
-
-            m_ri = RE_RIVER.match(raw)
-            if m_ri:
-                pre = parse_card_list(m_ri.group("pre"))
-                card = m_ri.group("card").strip()
-                cards = pre + [card]
-                self._new_street(current, "RIVER", cards)
-                current.river_dealt = True
-                w = wetness_score(cards)
-                ev = ActionEvent(current.hand_no, "RIVER", global_idx, raw, kind="board", board=cards, wetness=w)
-                events.append(ev)
-                global_idx += 1
-                continue
-
-            # Uncalled
-            m_unc = RE_UNCALLED.match(raw)
-            if m_unc:
-                p = m_unc.group("player")
-                amt = int(m_unc.group("amt"))
-                pot_before = current.pot
-                current.pot = max(0, current.pot - amt)
-                ev = ActionEvent(
-                    current.hand_no, current.street, global_idx, raw,
-                    player=p, kind="uncalled", amount=amt,
-                    pot_before=pot_before, pot_after=current.pot
-                )
-                events.append(ev)
-                global_idx += 1
-                continue
-
-            # Collected (winner)
-            m_col = RE_COLLECTED.match(raw)
-            if m_col:
-                p = m_col.group("player")
-                amt = int(m_col.group("amt"))
-                current.collected[p] += amt
-                ev = ActionEvent(
-                    current.hand_no, current.street, global_idx, raw,
-                    player=p, kind="collected", amount=amt
-                )
-                events.append(ev)
-                global_idx += 1
-                continue
-
-            # Shows / mucks
-            m_sh = RE_SHOWS.match(raw)
-            if m_sh:
-                p = m_sh.group("player")
-                c1 = m_sh.group("c1").strip()
-                c2 = m_sh.group("c2").strip()
-                current.any_show = True
-                current.shown_cards[p] = (c1, c2)
-                ev = ActionEvent(
-                    current.hand_no, current.street, global_idx, raw,
-                    player=p, kind="shows", show_cards=(c1, c2)
-                )
-                events.append(ev)
-                global_idx += 1
-                continue
-
-            m_mu = RE_MUCKS.match(raw)
-            if m_mu:
-                p = m_mu.group("player")
-                ev = ActionEvent(current.hand_no, current.street, global_idx, raw, player=p, kind="mucks")
-                events.append(ev)
-                global_idx += 1
-                continue
-
-            # Calls / Bets / Raises / All-in / Fold / Check
-            # Note: We count "opportunities" only when the player takes an action on that street.
-            m_fc = RE_FOLD_CHECK.match(raw)
-            if m_fc:
-                p = m_fc.group("player")
-                verb = m_fc.group("verb")
-                # opportunities
-                current.opp[(p, current.street)] += 1
-                if verb == "folds":
-                    current.active[p] = False
-                    kind = "fold"
-                else:
-                    kind = "check"
-
-                ev = ActionEvent(current.hand_no, current.street, global_idx, raw, player=p, kind=kind)
-                events.append(ev)
-                global_idx += 1
-                continue
-
-            m_ca = RE_CALL.match(raw)
-            if m_ca:
-                p = m_ca.group("player")
-                amt = int(m_ca.group("amt"))
-
-                current.opp[(p, current.street)] += 1  # had chance to raise too
-
-                delta, pot_before = self._apply_contribution(current, p, amt)
-
-                if current.street == "PREFLOP":
-                    current.preflop_total_put_in[p] = max(current.preflop_total_put_in[p], amt)
-                    # VPIP: voluntarily put money in preflop beyond forced (posting doesn't count)
-                    # You asked to exclude BB posting; calls count.
-                    current.vpip_flag[p] = True
-                    # Voluntary preflop continuation (for range rule)
-                    if amt >= current.bb_amt:
-                        current.voluntary_preflop_flag[p] = True
-
-                ev = ActionEvent(
-                    current.hand_no, current.street, global_idx, raw,
-                    player=p, kind="call", amount=amt,
-                    pot_before=pot_before, pot_after=current.pot, delta_put_in=delta
-                )
-                events.append(ev)
-                global_idx += 1
-                continue
-
-            m_be = RE_BET.match(raw)
-            if m_be:
-                p = m_be.group("player")
-                amt = int(m_be.group("amt"))
-
-                current.opp[(p, current.street)] += 1
-                current.aggr[(p, current.street)] += 1
-
-                delta, pot_before = self._apply_contribution(current, p, amt)
-                pot_frac = (delta / pot_before) if pot_before > 0 else np.nan
-                bucket = bucket_pot_fraction(pot_frac)
-
-                # VPIP/voluntary continuation if preflop bet
-                if current.street == "PREFLOP":
-                    current.vpip_flag[p] = True
-                    if amt >= current.bb_amt:
-                        current.voluntary_preflop_flag[p] = True
-
-                # record sizing
-                current.sizing_rows.append({
-                    "hand_no": current.hand_no,
-                    "player": p,
-                    "street": current.street,
-                    "action": "bet",
-                    "delta": delta,
-                    "amount_total_street": amt,
-                    "pot_before": pot_before,
-                    "pot_frac": pot_frac,
-                    "pot_bucket": bucket,
-                    "wetness": wetness_score(current.board) if current.street != "PREFLOP" else np.nan,
-                })
-
-                ev = ActionEvent(
-                    current.hand_no, current.street, global_idx, raw,
-                    player=p, kind="bet", amount=amt,
-                    pot_before=pot_before, pot_after=current.pot, delta_put_in=delta,
-                    pot_frac=pot_frac, pot_frac_bucket=bucket,
-                    wetness=wetness_score(current.board) if current.street != "PREFLOP" else None,
-                    board=list(current.board)
-                )
-                events.append(ev)
-                global_idx += 1
-                continue
-
-            m_ra = RE_RAISE.match(raw)
-            if m_ra:
-                p = m_ra.group("player")
-                amt = int(m_ra.group("amt"))
-
-                current.opp[(p, current.street)] += 1
-                current.aggr[(p, current.street)] += 1
-
-                delta, pot_before = self._apply_contribution(current, p, amt)
-                pot_frac = (delta / pot_before) if pot_before > 0 else np.nan
-                bucket = bucket_pot_fraction(pot_frac)
-
-                if current.street == "PREFLOP":
-                    current.vpip_flag[p] = True
-                    if amt >= current.bb_amt:
-                        current.voluntary_preflop_flag[p] = True
-
-                current.sizing_rows.append({
-                    "hand_no": current.hand_no,
-                    "player": p,
-                    "street": current.street,
-                    "action": "raise",
-                    "delta": delta,
-                    "amount_total_street": amt,
-                    "pot_before": pot_before,
-                    "pot_frac": pot_frac,
-                    "pot_bucket": bucket,
-                    "wetness": wetness_score(current.board) if current.street != "PREFLOP" else np.nan,
-                })
-
-                ev = ActionEvent(
-                    current.hand_no, current.street, global_idx, raw,
-                    player=p, kind="raise", amount=amt,
-                    pot_before=pot_before, pot_after=current.pot, delta_put_in=delta,
-                    pot_frac=pot_frac, pot_frac_bucket=bucket,
-                    wetness=wetness_score(current.board) if current.street != "PREFLOP" else None,
-                    board=list(current.board)
-                )
-                events.append(ev)
-                global_idx += 1
-                continue
-
-            m_ai = RE_ALLIN.match(raw)
-            if m_ai:
-                p = m_ai.group("player")
-                amt_s = m_ai.group("amt")
-                amt = int(amt_s) if amt_s else None
-
-                current.opp[(p, current.street)] += 1
-                current.aggr[(p, current.street)] += 1  # treat as aggressive
-
-                pot_before = current.pot
-                delta = None
-                if amt is not None:
-                    delta, pot_before2 = self._apply_contribution(current, p, amt)
-                    pot_before = pot_before2
-                    pot_frac = (delta / pot_before) if pot_before > 0 else np.nan
-                    bucket = bucket_pot_fraction(pot_frac)
-                else:
-                    pot_frac = np.nan
-                    bucket = "unknown"
-
-                if current.street == "PREFLOP":
-                    current.vpip_flag[p] = True
-                    if amt is None or amt >= current.bb_amt:
-                        current.voluntary_preflop_flag[p] = True
-
-                ev = ActionEvent(
-                    current.hand_no, current.street, global_idx, raw,
-                    player=p, kind="allin", amount=amt,
-                    pot_before=pot_before, pot_after=current.pot,
-                    delta_put_in=delta, pot_frac=pot_frac, pot_frac_bucket=bucket,
-                    wetness=wetness_score(current.board) if current.street != "PREFLOP" else None,
-                    board=list(current.board)
-                )
-                events.append(ev)
-                global_idx += 1
-                continue
-
-            # Unknown line inside a hand: keep as raw for debugging (optional)
-            ev = ActionEvent(current.hand_no, current.street, global_idx, raw, kind="unknown")
-            events.append(ev)
-            global_idx += 1
-
-        # If last hand wasn't closed by an ending line
-        if current is not None:
-            hands.append(current)
-
-        # After parsing, infer positions for each hand using preflop action order
-        events_df = pd.DataFrame([e.__dict__ for e in events])
-
-        # Build per-hand preflop actor order (first appearance of each player in PREFLOP actions, excluding blind posts)
-        for h in hands:
-            # find hand events
-            he = events_df[(events_df["hand_no"] == h.hand_no) & (events_df["street"] == "PREFLOP")]
-            # order by idx (chronological)
-            he = he.sort_values("idx")
-            preflop_actor_order = []
-            for _, r in he.iterrows():
-                if r["kind"] in ("post_sb", "post_bb", "board", "unknown"):
-                    continue
-                p = r.get("player")
-                if isinstance(p, str) and p and p not in preflop_actor_order:
-                    preflop_actor_order.append(p)
-
-            if h.sb_player and h.bb_player and h.players:
-                h.position = infer_positions(h.players, h.sb_player, h.bb_player, preflop_actor_order)
-
-        # Compute summary stats
-        summary_df = self._compute_summary(hands, events_df)
-
-        return events_df, summary_df
-
-    def _compute_summary(self, hands: List[HandState], events_df: pd.DataFrame) -> pd.DataFrame:
-        # Aggregators
-        hands_dealt = Counter()
-        vpip = Counter()
-        saw = Counter()  # (player, street) saw street
-        won_after = Counter()  # (player, street) win among those who saw that street
-        showdown_cnt = Counter()
-        aggr = Counter()  # (player, street)
-        opp = Counter()   # (player, street)
-        pos_cnt = Counter()  # (player, position)
-
-        # Observed range
-        observed_range = defaultdict(Counter)  # player -> Counter of combos like 'KQo','T8s'
-        observed_range_hands = Counter()  # #hands contributing to range
-
-        # Determine who "saw flop/turn/river" by fold timing:
-        # We'll use events to see first board marker and whether player had folded before it.
-        # Build per-hand fold street for each player.
-        fold_street = defaultdict(dict)  # hand_no -> player -> street at which they folded (or None)
-        for _, r in events_df.sort_values(["hand_no", "idx"]).iterrows():
-            hn = int(r["hand_no"])
-            k = r["kind"]
-            p = r.get("player")
-            st = r.get("street")
-            if k == "fold" and isinstance(p, str):
-                if p not in fold_street[hn]:
-                    fold_street[hn][p] = st
-
-        # Determine which streets occurred in each hand
-        hand_has_street = defaultdict(set)
-        for _, r in events_df.iterrows():
-            if r["kind"] == "board":
-                hand_has_street[int(r["hand_no"])].add(r["street"])
-
-        # For each hand: tally
-        for h in hands:
-            for p in h.players:
-                hands_dealt[p] += 1
-                if h.vpip_flag.get(p, False):
-                    # Exclude ONLY "posting BB" as a VPIP event:
-                    # Our vpip_flag only gets set on call/bet/raise/allin preflop (not blind posting), so ok.
-                    vpip[p] += 1
-
-                # positions
-                if h.position and p in h.position:
-                    pos_cnt[(p, h.position[p])] += 1
-
-                # saw streets if street exists AND player not folded before it
-                for st in ["FLOP", "TURN", "RIVER"]:
-                    if st in hand_has_street[h.hand_no]:
-                        f = fold_street[h.hand_no].get(p)
-                        # If they folded on PREFLOP they didn't see flop; folded on FLOP doesn't see turn, etc.
-                        if f is None:
-                            saw[(p, st)] += 1
-                        else:
-                            # Player folded at street f; they see only streets strictly before f
-                            if STREETS.index(st) < STREETS.index(f):
-                                saw[(p, st)] += 1
-
-                # win flags: if collected > 0
-                did_win = (h.collected.get(p, 0) > 0)
-                if did_win:
-                    for st in ["FLOP", "TURN", "RIVER"]:
-                        if saw[(p, st)] > 0:
-                            # We only want to count wins among hands where player saw st
-                            # We'll add 1 per hand if saw street
-                            f = fold_street[h.hand_no].get(p)
-                            if f is None or STREETS.index(st) < STREETS.index(f):
-                                won_after[(p, st)] += 1
-
-                # showdown percent: your definition = river dealt + at least one shows
-                showdown_happened = (h.river_dealt and h.any_show)
-                if showdown_happened:
-                    # player counted if they did NOT fold at any point
-                    f = fold_street[h.hand_no].get(p)
-                    if f is None:
-                        showdown_cnt[p] += 1
-
-            # Aggression/opportunities stored on HandState
-            for (p, st), n in h.opp.items():
-                opp[(p, st)] += n
-            for (p, st), n in h.aggr.items():
-                aggr[(p, st)] += n
-
-            # Observed range: only if showdown happened AND player voluntarily continued preflop (your clarified rule)
-            showdown_happened = (h.river_dealt and h.any_show)
-            if showdown_happened:
-                for p, (c1, c2) in h.shown_cards.items():
-                    if not h.voluntary_preflop_flag.get(p, False):
-                        continue
-                    combo = self._to_combo(c1, c2)
-                    observed_range[p][combo] += 1
-                    observed_range_hands[p] += 1
-
-        # Build summary df
-        players = sorted(hands_dealt.keys())
-
-        rows = []
-        for p in players:
-            hd = hands_dealt[p]
-            vp = vpip[p]
-            row = {
-                "player": p,
-                "hands_dealt": hd,
-                "VPIP": vp / hd if hd else np.nan,
-                "showdown_pct": showdown_cnt[p] / hd if hd else np.nan,
-            }
-
-            for st in ["PREFLOP", "FLOP", "TURN", "RIVER"]:
-                a = aggr[(p, st)]
-                o = opp[(p, st)]
-                row[f"aggr_freq_{st}"] = a / o if o else np.nan
-                row[f"opp_{st}"] = o
-                row[f"aggr_{st}"] = a
-
-            for st in ["FLOP", "TURN", "RIVER"]:
-                s = saw[(p, st)]
-                w = won_after[(p, st)]
-                row[f"saw_{st}"] = s
-                row[f"win_pct_if_saw_{st}"] = (w / s) if s else np.nan
-
-            # Top positions
-            # We'll add a few common position columns
-            for pos in ["UTG", "UTG+1", "UTG+2", "LJ", "HJ", "CO", "BTN", "SB", "BB", "BTN/SB", "BTN/UTG"]:
-                row[f"pos_{pos}"] = pos_cnt[(p, pos)]
-
-            # Range summary
-            if observed_range_hands[p] > 0:
-                top = observed_range[p].most_common(5)
-                row["range_top5"] = ", ".join([f"{k}:{v}" for k, v in top])
-                row["range_hands_counted"] = observed_range_hands[p]
-            else:
-                row["range_top5"] = ""
-                row["range_hands_counted"] = 0
-
-            rows.append(row)
-
-        return pd.DataFrame(rows)
-
+    """
+    Robust parser for logs that may be chronological or reverse chronological.
+    """
+
+    def __init__(self, bb_amt: float = 40.0, sb_amt: float = 20.0, verbose_hands: bool = False):
+        self.bb_amt = float(bb_amt)
+        self.sb_amt = float(sb_amt)
+        self.verbose_hands = bool(verbose_hands)
+        self.hero_name: Optional[str] = None
+
+    # ---------- combo ----------
     @staticmethod
-    def _to_combo(card1: str, card2: str) -> str:
-        """
-        Convert shown cards to combo notation: e.g. 'K♠','Q♣' -> 'KQo'
-        Rules:
-          - higher rank first
-          - suited => 's', offsuit => 'o'
-        """
-        r1, s1, v1 = parse_card(card1)
-        r2, s2, v2 = parse_card(card2)
+    def _to_combo(c1: str, c2: str) -> Optional[str]:
+        p1 = parse_card(c1)
+        p2 = parse_card(c2)
+        if not p1 or not p2:
+            return None
 
-        # order by rank value desc; break ties by suit for stability
-        if (v2 > v1) or (v2 == v1 and s2 > s1):
-            r1, s1, v1, r2, s2, v2 = r2, s2, v2, r1, s1, v1
+        r1, s1 = p1
+        r2, s2 = p2
+        r1 = normalize_rank(r1)
+        r2 = normalize_rank(r2)
 
+        if r1 == r2:
+            return f"{r1}{r2}"
+
+        # order by strength using _RANK_ORDER
+        i1 = _RANK_INDEX.get(r1, 999)
+        i2 = _RANK_INDEX.get(r2, 999)
         suited = (s1 == s2)
+
+        # higher rank first
+        if i1 < i2:
+            hi, lo = r1, r2
+        else:
+            hi, lo = r2, r1
+
         suffix = "s" if suited else "o"
-        return f"{r1}{r2}{suffix}"
+        return f"{hi}{lo}{suffix}"
+
+    # ---------- ordering ----------
+    @staticmethod
+    def _should_reverse(entries: List[str]) -> bool:
+        """
+        Detect reverse-chronological log order.
+        If the file begins with many 'ending hand' markers before 'starting hand', we reverse.
+        """
+        first_start = None
+        first_end = None
+        for i, s in enumerate(entries[:2000]):  # look early
+            if first_start is None and RE_START.search(s):
+                first_start = i
+            if first_end is None and RE_END.search(s):
+                first_end = i
+            if first_start is not None and first_end is not None:
+                break
+
+        if first_end is not None and (first_start is None or first_end < first_start):
+            return True
+
+        # fallback: count patterns end->(stuff)->start of same hand in forward direction
+        # if many, likely reverse
+        end_then_start_same = 0
+        last_end = None  # (hn, idx)
+        for i, s in enumerate(entries[:5000]):
+            me = RE_END.search(s)
+            if me:
+                last_end = (int(me.group("hn")), i)
+                continue
+            ms = RE_START.search(s)
+            if ms and last_end:
+                hn_s = int(ms.group("hn"))
+                hn_e, idx_e = last_end
+                if hn_s == hn_e and (i - idx_e) < 1000:
+                    end_then_start_same += 1
+        return end_then_start_same >= 2
+
+    # ---------- parse ----------
+    def parse_csv(self, csv_path: str, entry_col: str = "entry") -> Tuple[pd.DataFrame, pd.DataFrame]:
+        raw = pd.read_csv(csv_path)
+        if entry_col not in raw.columns:
+            raise ValueError(f"entry_col='{entry_col}' not found in columns: {raw.columns.tolist()}")
+
+        entries = raw[entry_col].astype(str).tolist()
+
+        reversed_mode = self._should_reverse(entries)
+        if reversed_mode:
+            entries = list(reversed(entries))
+            if self.verbose_hands:
+                print("INFO: Detected reverse-order log; reversing entries for chronological parsing.")
+
+        events: List[Dict[str, Any]] = []
+        idx_counter = 0
+
+        cur: Optional[HandState] = None
+
+        def add_event(hand_no: int, street: str, rawline: str, player: Optional[str], kind: str,
+                      amount: Optional[float] = None, delta_put_in: Optional[float] = None,
+                      pot_before: Optional[float] = None, pot_after: Optional[float] = None,
+                      show_cards: Optional[Tuple[str, str]] = None,
+                      board: Optional[List[str]] = None,
+                      position: Optional[str] = None,
+                      wetness: Optional[float] = None):
+            nonlocal idx_counter
+            ev = {
+                "hand_no": int(hand_no),
+                "street": street,
+                "idx": int(idx_counter),
+                "raw": rawline,
+                "player": player,
+                "kind": kind,
+                "amount": amount,
+                "pot_before": pot_before,
+                "pot_after": pot_after,
+                "delta_put_in": delta_put_in,
+                "pot_frac": np.nan,
+                "pot_frac_bucket": None,
+                "board": board,
+                "wetness": wetness,
+                "show_cards": show_cards,
+                "position": position,
+            }
+            idx_counter += 1
+            events.append(ev)
+
+        def update_pot_for_put_in(player: str, nominal_amount: float, kind: str, rawline: str):
+            """
+            Updates pot tracking based on action semantics:
+              - bet/call: nominal_amount is delta put in
+              - raise_to: nominal_amount is TOTAL for the street (so delta = total - already_put)
+              - post blinds: nominal_amount is delta
+            """
+            if cur is None:
+                return
+
+            player = str(player)
+            pot_before = float(cur.pot)
+
+            already = float(cur.put_in_street.get(player, 0.0))
+
+            if kind == "raise":
+                total = float(nominal_amount)
+                delta = max(total - already, 0.0)
+                cur.put_in_street[player] = already + delta
+            else:
+                delta = float(nominal_amount)
+                cur.put_in_street[player] = already + delta
+
+            cur.pot = pot_before + delta
+            pot_after = float(cur.pot)
+
+            pot_frac = (delta / pot_before) if pot_before > 0 else np.nan
+
+            position = cur.pos_map.get(player, "UNK") if cur else "UNK"
+
+            add_event(
+                hand_no=cur.hand_no,
+                street=cur.current_street,
+                rawline=rawline,
+                player=player,
+                kind=kind,
+                amount=float(nominal_amount),
+                delta_put_in=float(delta),
+                pot_before=pot_before,
+                pot_after=pot_after,
+                show_cards=None,
+                board=cur.board.copy() if cur.board else None,
+                position=position,
+                wetness=compute_wetness(cur.board),
+            )
+            # fill derived pot_frac info
+            events[-1]["pot_frac"] = pot_frac
+            events[-1]["pot_frac_bucket"] = pot_bucket(pot_frac)
+
+        def finalize_hand():
+            if cur is None:
+                return
+
+            # if we saw hero cards and know hero name, patch the hole event
+            if cur.hero_event_idx is not None and self.hero_name:
+                try:
+                    events[cur.hero_event_idx]["player"] = self.hero_name
+                    if cur.pos_map:
+                        events[cur.hero_event_idx]["position"] = cur.pos_map.get(self.hero_name, "UNK")
+                except Exception:
+                    pass
+
+            if self.verbose_hands:
+                # count events in this hand
+                evs = [e for e in events if int(e["hand_no"]) == int(cur.hand_no)]
+                kinds = pd.Series([e["kind"] for e in evs]).value_counts().to_dict() if evs else {}
+                print("=" * 72)
+                print(f"HAND #{cur.hand_no} summary")
+                print(f"  dealer: {cur.dealer}")
+                print(f"  seats: {len(cur.seat_order)} -> {cur.seat_order}")
+                if cur.pos_map:
+                    print(f"  positions: {cur.pos_map}")
+                else:
+                    print("  positions: (not inferred; missing stacks or dealer)")
+                print(f"  final board: {cur.board}")
+                print(f"  final pot (tracked): {cur.pot:.2f}")
+                print(f"  lines seen: {cur.lines_seen}")
+                print(f"  event counts: {kinds}")
+                print("=" * 72)
+
+        # parse line-by-line
+        for rawline in entries:
+            line = str(rawline).strip()
+            if cur is not None:
+                cur.lines_seen += 1
+
+            ms = RE_START.search(line)
+            if ms:
+                # new hand begins; finalize previous
+                finalize_hand()
+
+                hn = int(ms.group("hn"))
+                dealer = ms.group("dealer")
+                if self.verbose_hands:
+                    print(f"\n--- START hand #{hn} dealer={dealer} ---")
+
+                cur = HandState(hand_no=hn, dealer=dealer)
+                cur.current_street = "PREFLOP"
+                cur.board = []
+                cur.pot = 0.0
+                cur.put_in_street = {}
+                continue
+
+            me = RE_END.search(line)
+            if me:
+                # end of current hand (if matches)
+                hn_end = int(me.group("hn"))
+                # sometimes "end" marker appears even if we didn't start (should be rare after reversal)
+                if cur is None or cur.hand_no != hn_end:
+                    # tolerate but do not crash
+                    continue
+                if self.verbose_hands:
+                    print(f"--- END hand #{hn_end} ---\n")
+                finalize_hand()
+                cur = None
+                continue
+
+            # if we haven't started a hand yet, ignore
+            if cur is None:
+                continue
+
+            # Player stacks (seats)
+            mstk = RE_STACKS.search(line)
+            if mstk:
+                body = mstk.group("body")
+                items = RE_STACK_ITEM.findall(body)
+                # sort by seat number
+                parsed = []
+                for seat, name, stack in items:
+                    parsed.append((int(seat), name, float(stack)))
+                parsed.sort(key=lambda x: x[0])
+
+                cur.seat_order = [name for _, name, _ in parsed]
+                cur.pos_map = infer_positions(cur.seat_order, cur.dealer)
+                continue
+
+            # Your hand
+            myh = RE_YOUR_HAND.search(line)
+            if myh:
+                c1 = myh.group("c1").strip()
+                c2 = myh.group("c2").strip()
+                # normalize extracted card substrings
+                cards = cards_from_bracket_list(f"{c1} {c2}")
+                if len(cards) >= 2:
+                    c1n, c2n = cards[0], cards[1]
+                else:
+                    c1n, c2n = c1, c2
+
+                cur.hero_cards = (c1n, c2n)
+
+                # default player label until we infer who "you" are
+                player_label = self.hero_name if self.hero_name else "HERO"
+
+                position = cur.pos_map.get(player_label, "UNK") if cur.pos_map else "UNK"
+
+                add_event(
+                    hand_no=cur.hand_no,
+                    street=cur.current_street,
+                    rawline=line,
+                    player=player_label,
+                    kind="hole",
+                    amount=np.nan,
+                    delta_put_in=np.nan,
+                    pot_before=float(cur.pot),
+                    pot_after=float(cur.pot),
+                    show_cards=(c1n, c2n),
+                    board=cur.board.copy() if cur.board else None,
+                    position=position,
+                    wetness=compute_wetness(cur.board),
+                )
+                cur.hero_event_idx = len(events) - 1
+                continue
+
+            # Board lines
+            mf = RE_BOARD_FLOP.search(line)
+            mt = RE_BOARD_TURN.search(line)
+            mr = RE_BOARD_RIVER.search(line)
+
+            if mf:
+                cards = cards_from_bracket_list(mf.group("body"))
+                cur.current_street = "FLOP"
+                cur.put_in_street = {}
+                cur.board = cards[:3]
+                add_event(
+                    hand_no=cur.hand_no,
+                    street="FLOP",
+                    rawline=line,
+                    player=None,
+                    kind="board",
+                    amount=np.nan,
+                    delta_put_in=np.nan,
+                    pot_before=float(cur.pot),
+                    pot_after=float(cur.pot),
+                    show_cards=None,
+                    board=cur.board.copy(),
+                    position=None,
+                    wetness=compute_wetness(cur.board),
+                )
+                continue
+
+            if mt:
+                cards = cards_from_bracket_list(mt.group("body"))
+                cur.current_street = "TURN"
+                cur.put_in_street = {}
+                cur.board = cards[:4]
+                add_event(
+                    hand_no=cur.hand_no,
+                    street="TURN",
+                    rawline=line,
+                    player=None,
+                    kind="board",
+                    amount=np.nan,
+                    delta_put_in=np.nan,
+                    pot_before=float(cur.pot),
+                    pot_after=float(cur.pot),
+                    show_cards=None,
+                    board=cur.board.copy(),
+                    position=None,
+                    wetness=compute_wetness(cur.board),
+                )
+                continue
+
+            if mr:
+                cards = cards_from_bracket_list(mr.group("body"))
+                cur.current_street = "RIVER"
+                cur.put_in_street = {}
+                cur.board = cards[:5]
+                add_event(
+                    hand_no=cur.hand_no,
+                    street="RIVER",
+                    rawline=line,
+                    player=None,
+                    kind="board",
+                    amount=np.nan,
+                    delta_put_in=np.nan,
+                    pot_before=float(cur.pot),
+                    pot_after=float(cur.pot),
+                    show_cards=None,
+                    board=cur.board.copy(),
+                    position=None,
+                    wetness=compute_wetness(cur.board),
+                )
+                continue
+
+            # Uncalled bet returned
+            munc = RE_UNCALLED.search(line)
+            if munc:
+                player = munc.group("player")
+                amt = float(munc.group("amt"))
+                pot_before = float(cur.pot)
+                cur.pot = max(cur.pot - amt, 0.0)
+                pot_after = float(cur.pot)
+                position = cur.pos_map.get(player, "UNK") if cur.pos_map else "UNK"
+
+                add_event(
+                    hand_no=cur.hand_no,
+                    street=cur.current_street,
+                    rawline=line,
+                    player=player,
+                    kind="uncalled",
+                    amount=amt,
+                    delta_put_in=-amt,
+                    pot_before=pot_before,
+                    pot_after=pot_after,
+                    show_cards=None,
+                    board=cur.board.copy() if cur.board else None,
+                    position=position,
+                    wetness=compute_wetness(cur.board),
+                )
+                continue
+
+            # Collected
+            mcol = RE_COLLECTED.search(line)
+            if mcol:
+                player = mcol.group("player")
+                amt = float(mcol.group("amt"))
+                position = cur.pos_map.get(player, "UNK") if cur.pos_map else "UNK"
+                add_event(
+                    hand_no=cur.hand_no,
+                    street=cur.current_street,
+                    rawline=line,
+                    player=player,
+                    kind="collected",
+                    amount=amt,
+                    delta_put_in=np.nan,
+                    pot_before=float(cur.pot),
+                    pot_after=float(cur.pot),
+                    show_cards=None,
+                    board=cur.board.copy() if cur.board else None,
+                    position=position,
+                    wetness=compute_wetness(cur.board),
+                )
+                continue
+
+            # Shows
+            msh = RE_SHOWS.search(line)
+            if msh:
+                player = msh.group("player")
+                c1 = msh.group("c1").strip()
+                c2 = msh.group("c2").strip()
+                cards = cards_from_bracket_list(f"{c1} {c2}")
+                if len(cards) >= 2:
+                    c1n, c2n = cards[0], cards[1]
+                else:
+                    c1n, c2n = c1, c2
+
+                # infer hero name if we have hero cards for this hand and they match
+                if cur.hero_cards and not self.hero_name:
+                    a = set(cur.hero_cards)
+                    b = set([c1n, c2n])
+                    if a == b:
+                        self.hero_name = player
+                        if self.verbose_hands:
+                            print(f"INFO: Inferred hero_name = {self.hero_name} (matched Your hand cards).")
+                        # patch hole event now
+                        if cur.hero_event_idx is not None:
+                            events[cur.hero_event_idx]["player"] = self.hero_name
+                            if cur.pos_map:
+                                events[cur.hero_event_idx]["position"] = cur.pos_map.get(self.hero_name, "UNK")
+
+                position = cur.pos_map.get(player, "UNK") if cur.pos_map else "UNK"
+                add_event(
+                    hand_no=cur.hand_no,
+                    street=cur.current_street,
+                    rawline=line,
+                    player=player,
+                    kind="shows",
+                    amount=np.nan,
+                    delta_put_in=np.nan,
+                    pot_before=float(cur.pot),
+                    pot_after=float(cur.pot),
+                    show_cards=(c1n, c2n),
+                    board=cur.board.copy() if cur.board else None,
+                    position=position,
+                    wetness=compute_wetness(cur.board),
+                )
+                continue
+
+            # Posts blinds
+            mpb = RE_POST_BLIND.search(line)
+            if mpb:
+                player = mpb.group("player")
+                which = mpb.group("which")
+                amt = float(mpb.group("amt"))
+                kind = "post_sb" if which == "small" else "post_bb"
+                update_pot_for_put_in(player, amt, kind, line)
+                continue
+
+            # Checks/folds
+            mch = RE_CHECK.search(line)
+            if mch:
+                player = mch.group("player")
+                position = cur.pos_map.get(player, "UNK") if cur.pos_map else "UNK"
+                add_event(
+                    hand_no=cur.hand_no,
+                    street=cur.current_street,
+                    rawline=line,
+                    player=player,
+                    kind="check",
+                    amount=np.nan,
+                    delta_put_in=0.0,
+                    pot_before=float(cur.pot),
+                    pot_after=float(cur.pot),
+                    show_cards=None,
+                    board=cur.board.copy() if cur.board else None,
+                    position=position,
+                    wetness=compute_wetness(cur.board),
+                )
+                continue
+
+            mfd = RE_FOLD.search(line)
+            if mfd:
+                player = mfd.group("player")
+                position = cur.pos_map.get(player, "UNK") if cur.pos_map else "UNK"
+                add_event(
+                    hand_no=cur.hand_no,
+                    street=cur.current_street,
+                    rawline=line,
+                    player=player,
+                    kind="fold",
+                    amount=np.nan,
+                    delta_put_in=0.0,
+                    pot_before=float(cur.pot),
+                    pot_after=float(cur.pot),
+                    show_cards=None,
+                    board=cur.board.copy() if cur.board else None,
+                    position=position,
+                    wetness=compute_wetness(cur.board),
+                )
+                continue
+
+            # Calls/bets/raises
+            mcall = RE_CALL.search(line)
+            if mcall:
+                player = mcall.group("player")
+                amt = float(mcall.group("amt"))
+                kind = "call"
+                if RE_ALLIN_HINT.search(line):
+                    kind = "allin"
+                update_pot_for_put_in(player, amt, kind, line)
+                continue
+
+            mbet = RE_BET.search(line)
+            if mbet:
+                player = mbet.group("player")
+                amt = float(mbet.group("amt"))
+                kind = "bet"
+                if RE_ALLIN_HINT.search(line):
+                    kind = "allin"
+                update_pot_for_put_in(player, amt, kind, line)
+                continue
+
+            mraise = RE_RAISE_TO.search(line)
+            if mraise:
+                player = mraise.group("player")
+                amt = float(mraise.group("amt"))
+                kind = "raise"
+                if RE_ALLIN_HINT.search(line):
+                    kind = "allin"
+                update_pot_for_put_in(player, amt, kind, line)
+                continue
+
+            # else: ignore meta lines like run it twice, joins/leaves, undealt cards, etc.
+
+        # finalize if file ended mid-hand
+        finalize_hand()
+
+        events_df = pd.DataFrame(events)
+
+        # add n_players if possible (from seat_order is not stored in events; compute from player column)
+        if not events_df.empty:
+            events_df["n_players"] = (
+                events_df.groupby("hand_no")["player"]
+                .transform(lambda s: s.dropna().nunique())
+                .astype(int)
+            )
+        else:
+            events_df["n_players"] = pd.Series(dtype=int)
+
+        # normalize dtypes
+        if "player" in events_df.columns:
+            events_df["player"] = events_df["player"].astype(object)
+
+        # summary_df intentionally empty; run_analysis computes its own
+        summary_df = pd.DataFrame()
+        return events_df, summary_df
